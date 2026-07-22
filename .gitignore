@@ -3,4 +3,4 @@ __pycache__/
 *.pyc
 ngrok.zip.cynet
 uploads/
-results/
+results/.DS_Store
