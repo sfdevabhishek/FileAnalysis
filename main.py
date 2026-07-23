@@ -9,7 +9,7 @@ log = logging.getLogger("logiq")
 app = FastAPI(title="LogIQ Service")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://ne1781702927893.lightning.force.com"],
+    allow_origins=["*"],          # POC only — lock this down before production
     allow_methods=["*"],
     allow_headers=["*"],
 )
