@@ -1,11 +1,14 @@
-from fastapi import FastAPI, BackgroundTasks, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
-import uuid, base64, asyncio
+import uuid, base64, asyncio, os, hashlib, logging
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("logiq")
 
 app = FastAPI(title="LogIQ Service")
 
 jobs = {}     # job_id -> latest state (also serves the /status fallback)
-payloads = {} # job_id -> base64 content, waiting for the socket to connect
+payloads = {} # job_id -> base64 content, held until the socket connects
 
 class LogPayload(BaseModel):
     fileName: str
@@ -28,40 +31,58 @@ async def analyze(job_id: str, raw_b64: str, ws: WebSocket):
         await ws.send_json(update)
 
     await push("Received", 0, "File received")
-    await asyncio.sleep(0.2)  # small pauses so the stages are visible in the UI
 
+    # --- Decode and write to disk so we process a real file ---
     await push("Decoding", 10, "Decoding file")
     text = base64.b64decode(raw_b64).decode("utf-8", errors="ignore")
-    await asyncio.sleep(0.2)
+    checksum = hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()[:12]
+    path = f"/tmp/{job_id}.log"
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    size = os.path.getsize(path)
+    log.info(f"job={job_id} wrote {size} bytes checksum={checksum}")
 
-    await push("Parsing", 25, "Splitting into lines")
-    lines = text.splitlines()
-    total = len(lines)
-    await asyncio.sleep(0.2)
+    await push("Parsing", 25, "Preparing to read file")
 
-    await push("Analyzing", 40, f"Analyzing {total} lines")
+    # --- Stream-read from disk; progress = real bytes consumed ---
+    await push("Analyzing", 40, f"Reading file ({size} bytes)")
     errors = 0
     warnings = 0
-    step = max(1, total // 100)
-    for i, line in enumerate(lines):
-        low = line.lower()
-        if "error" in low or "exception" in low:
-            errors += 1
-        if "warn" in low:
-            warnings += 1
-        if i % step == 0 and total > 0:
-            pct = 40 + int((i / total) * 50)   # real progress in the 40–90 band
-            update = {"jobId": job_id, "stage": "Analyzing", "progress": pct,
-                      "message": f"Processed {i} of {total} lines",
-                      "status": "In Progress", "result": None}
-            jobs[job_id] = update
-            await ws.send_json(update)
-            await asyncio.sleep(0)  # yield so sends actually flush
+    total = 0
+    read = 0
+    last_pct = 40
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            read += len(line.encode("utf-8"))
+            total += 1
+            low = line.lower()
+            if "error" in low or "exception" in low:
+                errors += 1
+            if "warn" in low:
+                warnings += 1
+            pct = 40 + int((read / size) * 50) if size else 90
+            if pct != last_pct:  # only push when the real fraction changes
+                last_pct = pct
+                update = {"jobId": job_id, "stage": "Analyzing", "progress": pct,
+                          "message": f"Read {read} of {size} bytes ({total} lines)",
+                          "status": "In Progress", "result": None}
+                jobs[job_id] = update
+                await ws.send_json(update)
+                log.info(f"job={job_id} bytes={read}/{size} lines={total} progress={pct}")
+                await asyncio.sleep(0)  # yield so the send flushes
 
     await push("Finalizing", 90, "Building result")
-    await asyncio.sleep(0.2)
 
-    result = {"totalLines": total, "errors": errors, "warnings": warnings}
+    result = {"totalLines": total, "errors": errors, "warnings": warnings,
+              "checksum": checksum, "bytes": size}
+    log.info(f"job={job_id} COMPLETE lines={total} errors={errors} "
+             f"warnings={warnings} checksum={checksum}")
+
+    try:
+        os.remove(path)  # clean up the temp file
+    except OSError:
+        pass
+
     await push("Complete", 100, "Analysis complete", status="Complete", result=result)
 
 @app.get("/")
