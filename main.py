@@ -1,46 +1,45 @@
-from fastapi import FastAPI, BackgroundTasks
+from fastapi import FastAPI, BackgroundTasks, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
-import uuid, base64
+import uuid, base64, asyncio
 
 app = FastAPI(title="LogIQ Service")
 
-jobs = {}  # in-memory store — fine for a POC (resets when the service restarts)
+jobs = {}     # job_id -> latest state (also serves the /status fallback)
+payloads = {} # job_id -> base64 content, waiting for the socket to connect
 
 class LogPayload(BaseModel):
     fileName: str
     content: str  # base64-encoded file contents
 
-# ordered pipeline stages, each mapped to the progress value it starts at
 STAGES = [
     ("Received",   0),
     ("Decoding",   10),
     ("Parsing",    25),
-    ("Analyzing",  40),   # the real work happens across 40–90
+    ("Analyzing",  40),
     ("Finalizing", 90),
     ("Complete",   100),
 ]
 
-def set_stage(job_id, stage_name, progress=None, message=None):
-    base = dict(jobs[job_id])
-    base["stage"] = stage_name
-    if progress is not None:
-        base["progress"] = progress
-    if message is not None:
-        base["message"] = message
-    base["status"] = "Complete" if stage_name == "Complete" else "In Progress"
-    jobs[job_id] = base
+async def analyze(job_id: str, raw_b64: str, ws: WebSocket):
+    async def push(stage, progress, message, status="In Progress", result=None):
+        update = {"jobId": job_id, "stage": stage, "progress": progress,
+                  "message": message, "status": status, "result": result}
+        jobs[job_id] = update
+        await ws.send_json(update)
 
-def analyze(job_id: str, raw_b64: str):
-    set_stage(job_id, "Received", 0, "File received")
+    await push("Received", 0, "File received")
+    await asyncio.sleep(0.2)  # small pauses so the stages are visible in the UI
 
-    set_stage(job_id, "Decoding", 10, "Decoding file")
+    await push("Decoding", 10, "Decoding file")
     text = base64.b64decode(raw_b64).decode("utf-8", errors="ignore")
+    await asyncio.sleep(0.2)
 
-    set_stage(job_id, "Parsing", 25, "Splitting into lines")
+    await push("Parsing", 25, "Splitting into lines")
     lines = text.splitlines()
     total = len(lines)
+    await asyncio.sleep(0.2)
 
-    set_stage(job_id, "Analyzing", 40, f"Analyzing {total} lines")
+    await push("Analyzing", 40, f"Analyzing {total} lines")
     errors = 0
     warnings = 0
     step = max(1, total // 100)
@@ -51,29 +50,50 @@ def analyze(job_id: str, raw_b64: str):
         if "warn" in low:
             warnings += 1
         if i % step == 0 and total > 0:
-            # spread real progress across the 40–90 band reserved for analysis
-            pct = 40 + int((i / total) * 50)
-            jobs[job_id].update(progress=pct, message=f"Processed {i} of {total} lines")
+            pct = 40 + int((i / total) * 50)   # real progress in the 40–90 band
+            update = {"jobId": job_id, "stage": "Analyzing", "progress": pct,
+                      "message": f"Processed {i} of {total} lines",
+                      "status": "In Progress", "result": None}
+            jobs[job_id] = update
+            await ws.send_json(update)
+            await asyncio.sleep(0)  # yield so sends actually flush
 
-    set_stage(job_id, "Finalizing", 90, "Building result")
+    await push("Finalizing", 90, "Building result")
+    await asyncio.sleep(0.2)
 
     result = {"totalLines": total, "errors": errors, "warnings": warnings}
-    set_stage(job_id, "Complete", 100, "Analysis complete")
-    jobs[job_id]["result"] = result
+    await push("Complete", 100, "Analysis complete", status="Complete", result=result)
 
 @app.get("/")
 def health():
     return {"service": "LogIQ", "status": "up"}
 
 @app.post("/analyze")
-def start(payload: LogPayload, bg: BackgroundTasks):
+def start(payload: LogPayload):
     job_id = str(uuid.uuid4())
-    jobs[job_id] = {"status": "Queued", "stage": "Queued", "progress": 0,
-                    "message": "Queued", "result": None}
-    bg.add_task(analyze, job_id, payload.content)
+    jobs[job_id] = {"jobId": job_id, "status": "Queued", "stage": "Queued",
+                    "progress": 0, "message": "Waiting for connection", "result": None}
+    payloads[job_id] = payload.content   # held until the socket connects
     return {"jobId": job_id}
+
+@app.websocket("/ws/{job_id}")
+async def ws_progress(websocket: WebSocket, job_id: str):
+    await websocket.accept()
+    raw = payloads.pop(job_id, None)
+    if raw is None:
+        await websocket.send_json({"jobId": job_id, "status": "Error", "stage": "Error",
+                                   "progress": 0, "message": "Unknown or already-run job",
+                                   "result": None})
+        await websocket.close()
+        return
+    try:
+        await analyze(job_id, raw, websocket)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        await websocket.close()
 
 @app.get("/status/{job_id}")
 def status(job_id: str):
-    return jobs.get(job_id, {"status": "Not Found", "stage": "Not Found",
+    return jobs.get(job_id, {"jobId": job_id, "status": "Not Found", "stage": "Not Found",
                              "progress": 0, "message": "Unknown job", "result": None})
