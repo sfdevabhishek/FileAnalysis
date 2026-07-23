@@ -1,11 +1,18 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 import uuid, base64, asyncio, os, hashlib, logging
+from fastapi.middleware.cors import CORSMiddleware
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("logiq")
 
 app = FastAPI(title="LogIQ Service")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://ne1781702927893.lightning.force.com"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 jobs = {}     # job_id -> latest state (also serves the /status fallback)
 payloads = {} # job_id -> base64 content, held until the socket connects
